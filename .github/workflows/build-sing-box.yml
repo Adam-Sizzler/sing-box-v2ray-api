@@ -161,7 +161,7 @@ jobs:
           mkdir -p artifacts
           GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} GOARM=${{ matrix.goarm }} GO386=${{ matrix.go386 }} \
           GOMIPS=${{ matrix.goarch_extra }} GOMIPS64=${{ matrix.goarch_extra }} CGO_ENABLED=0 \
-            go build -v -trimpath -tags "$TAGS" \
+            go build -gcflags=all=-e -v -trimpath -tags "$TAGS" \
             -ldflags "-s -buildid= -X 'github.com/sagernet/sing-box/constant.Version=$VERSION'" \
             -o "./artifacts/$BINARY_NAME" ./cmd/sing-box
         shell: bash {0}
@@ -189,7 +189,7 @@ jobs:
           if ("${{ matrix.go386 }}" -ne "") { $env:GO386="${{ matrix.go386 }}" }
           if ("${{ matrix.goarch_extra }}" -ne "") { $env:GOMIPS="${{ matrix.goarch_extra }}"; $env:GOMIPS64="${{ matrix.goarch_extra }}" }
           $env:CGO_ENABLED="0"
-          go build -v -trimpath -tags "$TAGS" -ldflags "-s -buildid= -X 'github.com/sagernet/sing-box/constant.Version=$VERSION'" -o "./artifacts/$BINARY_NAME" ./cmd/sing-box
+          go build -gcflags=all=-e -v -trimpath -tags "$TAGS" -ldflags "-s -buildid= -X 'github.com/sagernet/sing-box/constant.Version=$VERSION'" -o "./artifacts/$BINARY_NAME" ./cmd/sing-box
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
