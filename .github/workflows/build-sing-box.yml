@@ -2,6 +2,12 @@ name: Build and Release sing-box
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "sing-box version, example: 1.13.5 or v1.13.5. Empty = latest"
+        required: false
+        type: string
+        default: ""
   push:
     branches:
       - main
@@ -26,6 +32,7 @@ jobs:
       version: ${{ steps.get_tag.outputs.version }}
       tag_name: ${{ steps.get_tag.outputs.tag_name }}
       release_exists: ${{ steps.check_release.outputs.release_exists }}
+      should_build: ${{ steps.check_release.outputs.should_build }}
       changelog: ${{ steps.extract_changelog.outputs.changelog }}
 
     steps:
@@ -35,19 +42,31 @@ jobs:
           repository: ${{ env.UPSTREAM_REPO }}
           fetch-depth: 0
 
-      - name: Get latest tag
+      - name: Get requested or latest tag
         id: get_tag
         shell: bash
+        env:
+          REQUESTED_VERSION: ${{ github.event.inputs.version }}
         run: |
           set -euo pipefail
 
           git fetch --tags --force
 
-          VERSION="$(git describe --tags --abbrev=0 | sed 's/^v*//')"
-          TAG_NAME="v${VERSION}"
+          if [ -n "${REQUESTED_VERSION}" ]; then
+            VERSION="${REQUESTED_VERSION#v}"
+            TAG_NAME="v${VERSION}"
 
-          echo "Latest tag is: ${TAG_NAME}"
-          echo "Version is: ${VERSION}"
+            if ! git rev-parse -q --verify "refs/tags/${TAG_NAME}" >/dev/null; then
+              echo "Requested upstream tag does not exist: ${TAG_NAME}"
+              exit 1
+            fi
+          else
+            VERSION="$(git describe --tags --abbrev=0 | sed 's/^v*//')"
+            TAG_NAME="v${VERSION}"
+          fi
+
+          echo "Selected tag is: ${TAG_NAME}"
+          echo "Selected version is: ${VERSION}"
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
@@ -81,6 +100,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ steps.get_tag.outputs.tag_name }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
@@ -105,11 +125,22 @@ jobs:
             exit 1
           fi
 
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Manual run: build is forced"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif [ "$HTTP_CODE" = "404" ]; then
+            echo "No existing release: build is allowed"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Existing release on non-manual run: build is skipped"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build_linux:
     name: Build Linux
     needs:
       - calculate_version
-    if: needs.calculate_version.outputs.release_exists == 'false'
+    if: needs.calculate_version.outputs.should_build == 'true'
     runs-on: ubuntu-latest
 
     strategy:
@@ -118,22 +149,13 @@ jobs:
         include:
           - { arch: amd64 }
           - { arch: arm64 }
-          - { arch: "386", go386: sse2 }
-          - { arch: arm, goarm: "7" }
-          - { arch: arm, goarm: "6" }
-          - { arch: mips, gomips: softfloat }
-          - { arch: mipsle, gomips: softfloat }
-          - { arch: mips64, gomips: softfloat }
-          - { arch: mips64le, gomips: hardfloat }
-          - { arch: riscv64 }
-          - { arch: ppc64le }
-          - { arch: s390x }
 
     steps:
       - name: Checkout SagerNet/sing-box
         uses: actions/checkout@v6
         with:
           repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.calculate_version.outputs.tag_name }}
           fetch-depth: 0
 
       - name: Setup Go
@@ -166,10 +188,6 @@ jobs:
           CGO_ENABLED: "0"
           GOOS: linux
           GOARCH: ${{ matrix.arch }}
-          GO386: ${{ matrix.go386 }}
-          GOARM: ${{ matrix.goarm }}
-          GOMIPS: ${{ matrix.gomips }}
-          GOMIPS64: ${{ matrix.gomips }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -177,20 +195,6 @@ jobs:
           git tag "$TAG_NAME" -f
 
           TAGS="with_gvisor,with_quic,with_dhcp,with_utls,with_acme,with_clash_api,with_tailscale,with_v2ray_api"
-
-          BINARY_NAME="sing-box-linux-${{ matrix.arch }}"
-
-          if [ -n "${{ matrix.go386 }}" ]; then
-            BINARY_NAME="${BINARY_NAME}-${{ matrix.go386 }}"
-          fi
-
-          if [ -n "${{ matrix.goarm }}" ]; then
-            BINARY_NAME="${BINARY_NAME}v${{ matrix.goarm }}"
-          fi
-
-          if [ -n "${{ matrix.gomips }}" ]; then
-            BINARY_NAME="${BINARY_NAME}-${{ matrix.gomips }}"
-          fi
 
           mkdir -p dist
           mkdir -p artifacts
@@ -203,18 +207,6 @@ jobs:
 
           DIR_NAME="sing-box-${VERSION}-linux-${{ matrix.arch }}"
 
-          if [ -n "${{ matrix.go386 }}" ]; then
-            DIR_NAME="${DIR_NAME}-${{ matrix.go386 }}"
-          fi
-
-          if [ -n "${{ matrix.goarm }}" ]; then
-            DIR_NAME="${DIR_NAME}v${{ matrix.goarm }}"
-          fi
-
-          if [ -n "${{ matrix.gomips }}" ]; then
-            DIR_NAME="${DIR_NAME}-${{ matrix.gomips }}"
-          fi
-
           mkdir -p "package/${DIR_NAME}"
 
           cp LICENSE "package/${DIR_NAME}/LICENSE"
@@ -225,14 +217,14 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: linux_${{ matrix.arch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}${{ matrix.go386 && format('_{0}', matrix.go386) || '' }}${{ matrix.gomips && format('_{0}', matrix.gomips) || '' }}
+          name: linux_${{ matrix.arch }}
           path: artifacts/*
 
   build_windows:
     name: Build Windows
     needs:
       - calculate_version
-    if: needs.calculate_version.outputs.release_exists == 'false'
+    if: needs.calculate_version.outputs.should_build == 'true'
     runs-on: windows-latest
 
     strategy:
@@ -240,7 +232,6 @@ jobs:
       matrix:
         include:
           - { arch: amd64 }
-          - { arch: "386" }
           - { arch: arm64 }
 
     steps:
@@ -248,6 +239,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.calculate_version.outputs.tag_name }}
           fetch-depth: 0
 
       - name: Setup Go
@@ -313,12 +305,12 @@ jobs:
           path: artifacts/*
 
   release:
-    name: Create Release
+    name: Create or update Release
     needs:
       - calculate_version
       - build_linux
       - build_windows
-    if: needs.calculate_version.outputs.release_exists == 'false' && !failure() && !cancelled()
+    if: needs.calculate_version.outputs.should_build == 'true' && !failure() && !cancelled()
     runs-on: ubuntu-latest
 
     steps:
@@ -343,12 +335,13 @@ jobs:
           set -euo pipefail
           printf '%s\n' "$CHANGELOG" > RELEASE_NOTES.md
 
-      - name: Create release
+      - name: Create or update release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ needs.calculate_version.outputs.tag_name }}
           VERSION: ${{ needs.calculate_version.outputs.version }}
+          RELEASE_EXISTS: ${{ needs.calculate_version.outputs.release_exists }}
         run: |
           set -euo pipefail
 
@@ -359,7 +352,22 @@ jobs:
             exit 1
           fi
 
-          gh release create "$TAG_NAME" "${FILES[@]}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$VERSION" \
-            --notes-file RELEASE_NOTES.md
+          if [ "$RELEASE_EXISTS" = "true" ]; then
+            echo "Release $TAG_NAME already exists, uploading assets with --clobber"
+
+            gh release edit "$TAG_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$VERSION" \
+              --notes-file RELEASE_NOTES.md
+
+            gh release upload "$TAG_NAME" "${FILES[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            echo "Creating release $TAG_NAME"
+
+            gh release create "$TAG_NAME" "${FILES[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$VERSION" \
+              --notes-file RELEASE_NOTES.md
+          fi
