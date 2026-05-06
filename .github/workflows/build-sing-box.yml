@@ -23,74 +23,66 @@ jobs:
     name: Calculate version
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      tag_name: ${{ steps.version.outputs.tag_name }}
+      version: ${{ steps.get_tag.outputs.version }}
+      tag_name: ${{ steps.get_tag.outputs.tag_name }}
       release_exists: ${{ steps.check_release.outputs.release_exists }}
-      changelog: ${{ steps.changelog.outputs.changelog }}
+      changelog: ${{ steps.extract_changelog.outputs.changelog }}
+
     steps:
-      - name: Checkout upstream sing-box
+      - name: Checkout SagerNet/sing-box
         uses: actions/checkout@v6
         with:
           repository: ${{ env.UPSTREAM_REPO }}
           fetch-depth: 0
 
-      - name: Get latest upstream tag
-        id: version
+      - name: Get latest tag
+        id: get_tag
         shell: bash
         run: |
           set -euo pipefail
 
           git fetch --tags --force
 
-          LATEST_TAG="$(git tag -l 'v*' --sort=-v:refname | head -n 1)"
+          VERSION="$(git describe --tags --abbrev=0 | sed 's/^v*//')"
+          TAG_NAME="v${VERSION}"
 
-          if [ -z "$LATEST_TAG" ]; then
-            echo "No upstream tags found"
-            exit 1
-          fi
+          echo "Latest tag is: ${TAG_NAME}"
+          echo "Version is: ${VERSION}"
 
-          VERSION="${LATEST_TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
 
-          echo "Latest upstream tag: $LATEST_TAG"
-          echo "Version: $VERSION"
-
-          echo "tag_name=$LATEST_TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Extract changelog from upstream release
-        id: changelog
+      - name: Extract changelog from GitHub release
+        id: extract_changelog
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ steps.version.outputs.tag_name }}
+          TAG_NAME: ${{ steps.get_tag.outputs.tag_name }}
         run: |
           set -euo pipefail
 
-          API_URL="https://api.github.com/repos/${UPSTREAM_REPO}/releases/tags/${TAG_NAME}"
-
-          BODY="$(
+          CHANGELOG="$(
             curl -fsSL \
               -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
-              "$API_URL" | jq -r '.body // "No changelog available"'
-          )" || BODY="No changelog available"
+              "https://api.github.com/repos/${UPSTREAM_REPO}/releases/tags/${TAG_NAME}" \
+              | jq -r '.body // "No changelog available"'
+          )" || CHANGELOG="No changelog available"
 
           {
             echo "changelog<<EOF"
-            echo "$BODY"
+            echo "$CHANGELOG"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Check if release already exists in this repo
+      - name: Check if release already exists in THIS repo
         id: check_release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ steps.version.outputs.tag_name }}
+          TAG_NAME: ${{ steps.get_tag.outputs.tag_name }}
         run: |
           set -euo pipefail
-
-          API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG_NAME}"
 
           HTTP_CODE="$(
             curl -sS \
@@ -98,7 +90,7 @@ jobs:
               -w "%{http_code}" \
               -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
-              "$API_URL"
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG_NAME}"
           )"
 
           if [ "$HTTP_CODE" = "200" ]; then
@@ -119,6 +111,7 @@ jobs:
       - calculate_version
     if: needs.calculate_version.outputs.release_exists == 'false'
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
@@ -135,8 +128,9 @@ jobs:
           - { arch: riscv64 }
           - { arch: ppc64le }
           - { arch: s390x }
+
     steps:
-      - name: Checkout upstream sing-box
+      - name: Checkout SagerNet/sing-box
         uses: actions/checkout@v6
         with:
           repository: ${{ env.UPSTREAM_REPO }}
@@ -145,25 +139,30 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: "~1.25.9"
+          go-version: "1.24.x"
 
-      - name: Set build environment
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ matrix.arch }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ matrix.arch }}-
+            ${{ runner.os }}-go-
+
+      - name: Download dependencies
         shell: bash
-        env:
-          VERSION: ${{ needs.calculate_version.outputs.version }}
-          TAG_NAME: ${{ needs.calculate_version.outputs.tag_name }}
         run: |
           set -euo pipefail
-
-          git tag "$TAG_NAME" -f
-
-          echo "BUILD_TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)" >> "$GITHUB_ENV"
-          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "$GITHUB_ENV"
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          go mod download
 
       - name: Build sing-box
         shell: bash
         env:
+          VERSION: ${{ needs.calculate_version.outputs.version }}
+          TAG_NAME: ${{ needs.calculate_version.outputs.tag_name }}
           CGO_ENABLED: "0"
           GOOS: linux
           GOARCH: ${{ matrix.arch }}
@@ -175,45 +174,58 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p dist
+          git tag "$TAG_NAME" -f
 
-          go build -v -trimpath \
-            -tags "$BUILD_TAGS" \
-            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
-            -o dist/sing-box \
+          TAGS="with_gvisor,with_quic,with_dhcp,with_utls,with_acme,with_clash_api,with_tailscale,with_v2ray_api"
+
+          BINARY_NAME="sing-box-linux-${{ matrix.arch }}"
+
+          if [ -n "${{ matrix.go386 }}" ]; then
+            BINARY_NAME="${BINARY_NAME}-${{ matrix.go386 }}"
+          fi
+
+          if [ -n "${{ matrix.goarm }}" ]; then
+            BINARY_NAME="${BINARY_NAME}v${{ matrix.goarm }}"
+          fi
+
+          if [ -n "${{ matrix.gomips }}" ]; then
+            BINARY_NAME="${BINARY_NAME}-${{ matrix.gomips }}"
+          fi
+
+          mkdir -p dist
+          mkdir -p artifacts
+
+          go build -gcflags=all=-e -v -trimpath \
+            -tags "$TAGS" \
+            -ldflags "-s -buildid= -X 'github.com/sagernet/sing-box/constant.Version=${VERSION}'" \
+            -o "dist/sing-box" \
             ./cmd/sing-box
 
-      - name: Package Linux archive
-        shell: bash
-        run: |
-          set -euo pipefail
-
           DIR_NAME="sing-box-${VERSION}-linux-${{ matrix.arch }}"
+
+          if [ -n "${{ matrix.go386 }}" ]; then
+            DIR_NAME="${DIR_NAME}-${{ matrix.go386 }}"
+          fi
 
           if [ -n "${{ matrix.goarm }}" ]; then
             DIR_NAME="${DIR_NAME}v${{ matrix.goarm }}"
           fi
 
-          if [ -n "${{ matrix.go386 }}" ] && [ "${{ matrix.go386 }}" != "sse2" ]; then
-            DIR_NAME="${DIR_NAME}-${{ matrix.go386 }}"
-          fi
-
-          if [ -n "${{ matrix.gomips }}" ] && [ "${{ matrix.gomips }}" != "hardfloat" ]; then
+          if [ -n "${{ matrix.gomips }}" ]; then
             DIR_NAME="${DIR_NAME}-${{ matrix.gomips }}"
           fi
 
           mkdir -p "package/${DIR_NAME}"
-          mkdir -p artifacts
 
           cp LICENSE "package/${DIR_NAME}/LICENSE"
           cp dist/sing-box "package/${DIR_NAME}/sing-box"
 
           tar -C package -czvf "artifacts/${DIR_NAME}.tar.gz" "${DIR_NAME}"
 
-      - name: Upload Linux artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: binary-linux_${{ matrix.arch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}${{ matrix.go386 && format('_{0}', matrix.go386) || '' }}${{ matrix.gomips && format('_{0}', matrix.gomips) || '' }}
+          name: linux_${{ matrix.arch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}${{ matrix.go386 && format('_{0}', matrix.go386) || '' }}${{ matrix.gomips && format('_{0}', matrix.gomips) || '' }}
           path: artifacts/*
 
   build_windows:
@@ -222,15 +234,17 @@ jobs:
       - calculate_version
     if: needs.calculate_version.outputs.release_exists == 'false'
     runs-on: windows-latest
+
     strategy:
       fail-fast: false
       matrix:
         include:
           - { arch: amd64 }
-          - { arch: arm64 }
           - { arch: "386" }
+          - { arch: arm64 }
+
     steps:
-      - name: Checkout upstream sing-box
+      - name: Checkout SagerNet/sing-box
         uses: actions/checkout@v6
         with:
           repository: ${{ env.UPSTREAM_REPO }}
@@ -239,43 +253,50 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: "~1.25.9"
+          go-version: "1.24.x"
 
-      - name: Set build environment
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\go-build
+            ~\go\pkg\mod
+          key: ${{ runner.os }}-go-${{ matrix.arch }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ matrix.arch }}-
+            ${{ runner.os }}-go-
+
+      - name: Download dependencies
         shell: pwsh
         run: |
-          git tag "${{ needs.calculate_version.outputs.tag_name }}" -f
-
-          $BUILD_TAGS = Get-Content release/DEFAULT_BUILD_TAGS_OTHERS
-          $LDFLAGS_SHARED = Get-Content release/LDFLAGS
-
-          "BUILD_TAGS=$BUILD_TAGS" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "LDFLAGS_SHARED=$LDFLAGS_SHARED" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "VERSION=${{ needs.calculate_version.outputs.version }}" | Out-File -FilePath $env:GITHUB_ENV -Append
+          go mod download
 
       - name: Build sing-box
         shell: pwsh
         env:
+          VERSION: ${{ needs.calculate_version.outputs.version }}
+          TAG_NAME: ${{ needs.calculate_version.outputs.tag_name }}
           CGO_ENABLED: "0"
           GOOS: windows
           GOARCH: ${{ matrix.arch }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          git tag "$env:TAG_NAME" -f
 
-          go build -v -trimpath `
-            -tags "$env:BUILD_TAGS" `
-            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$env:VERSION' $env:LDFLAGS_SHARED -s -w -buildid=" `
-            -o dist/sing-box.exe `
+          $TAGS = "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_v2ray_api"
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+
+          go build -gcflags=all=-e -v -trimpath `
+            -tags "$TAGS" `
+            -ldflags "-s -buildid= -X 'github.com/sagernet/sing-box/constant.Version=$env:VERSION'" `
+            -o "dist/sing-box.exe" `
             ./cmd/sing-box
 
-      - name: Package Windows archive
-        shell: pwsh
-        run: |
           $DIR_NAME = "sing-box-$env:VERSION-windows-${{ matrix.arch }}"
 
           New-Item -ItemType Directory -Force -Path "package/$DIR_NAME" | Out-Null
-          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
 
           Copy-Item LICENSE "package/$DIR_NAME/LICENSE"
           Copy-Item "dist/sing-box.exe" "package/$DIR_NAME/sing-box.exe"
@@ -285,10 +306,10 @@ jobs:
             -DestinationPath "artifacts/$DIR_NAME.zip" `
             -Force
 
-      - name: Upload Windows artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: binary-windows_${{ matrix.arch }}
+          name: windows_${{ matrix.arch }}
           path: artifacts/*
 
   release:
@@ -299,12 +320,20 @@ jobs:
       - build_windows
     if: needs.calculate_version.outputs.release_exists == 'false' && !failure() && !cancelled()
     runs-on: ubuntu-latest
+
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v7
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Debug artifact structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Artifacts:"
+          find artifacts -type f | sort
 
       - name: Prepare release notes
         shell: bash
@@ -314,14 +343,7 @@ jobs:
           set -euo pipefail
           printf '%s\n' "$CHANGELOG" > RELEASE_NOTES.md
 
-      - name: Debug artifact structure
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Artifacts:"
-          find artifacts -type f -maxdepth 5 | sort
-
-      - name: Create GitHub release
+      - name: Create release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -340,5 +362,4 @@ jobs:
           gh release create "$TAG_NAME" "${FILES[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$VERSION" \
-            --notes-file RELEASE_NOTES.md \
-            --latest
+            --notes-file RELEASE_NOTES.md
