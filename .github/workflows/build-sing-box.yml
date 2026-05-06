@@ -6,266 +6,339 @@ on:
     branches:
       - main
   schedule:
-    - cron: '0 */12 * * *'
+    - cron: "0 */12 * * *"
+
+permissions:
+  contents: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ inputs.build }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: SagerNet/sing-box
 
 jobs:
   calculate_version:
     name: Calculate version
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.get_tag.outputs.version }}
-      tag_exists: ${{ steps.check_tag.outputs.result }}
-      changelog: ${{ steps.extract_changelog.outputs.changelog }}
+      version: ${{ steps.version.outputs.version }}
+      tag_name: ${{ steps.version.outputs.tag_name }}
+      release_exists: ${{ steps.check_release.outputs.release_exists }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
     steps:
-      - name: Checkout SagerNet/sing-box
-        uses: actions/checkout@v4
+      - name: Checkout upstream sing-box
+        uses: actions/checkout@v6
         with:
-          repository: SagerNet/sing-box
+          repository: ${{ env.UPSTREAM_REPO }}
           fetch-depth: 0
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24.x'
-
-      - name: Get latest tag
-        id: get_tag
+      - name: Get latest upstream tag
+        id: version
+        shell: bash
         run: |
-          LATEST_TAG=$(git describe --tags --abbrev=0 | sed 's/^v*//')
-          echo "Latest tag is: $LATEST_TAG"
-          echo "version=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
 
-      - name: Extract changelog from GitHub release
-        id: extract_changelog
+          git fetch --tags --force
+
+          LATEST_TAG="$(git tag -l 'v*' --sort=-v:refname | head -n 1)"
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No upstream tags found"
+            exit 1
+          fi
+
+          VERSION="${LATEST_TAG#v}"
+
+          echo "Latest upstream tag: $LATEST_TAG"
+          echo "Version: $VERSION"
+
+          echo "tag_name=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Extract changelog from upstream release
+        id: changelog
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.version.outputs.tag_name }}
         run: |
-          VERSION=${{ steps.get_tag.outputs.version }}
-          TAG="v${VERSION}"
-          CHANGELOG=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/SagerNet/sing-box/releases/tags/${TAG}" | \
-            jq -r '.body // "No changelog available"')
-          echo "changelog<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$CHANGELOG" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
 
-      - name: Check if tag already exists in THIS repo
-        id: check_tag
-        uses: actions/github-script@v7
-        with:
-          result-encoding: string
-          script: |
-            const version = '${{ steps.get_tag.outputs.version }}';
-            const tagName = `v${version}`;
-            try {
-              await github.rest.git.getRef({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                ref: `tags/${tagName}`
-              });
-              return 'true';
-            } catch (err) {
-              if (err.status === 404) {
-                return 'false';
-              }
-              throw err;
-            }
+          API_URL="https://api.github.com/repos/${UPSTREAM_REPO}/releases/tags/${TAG_NAME}"
 
-  build:
-    name: Build binary
-    needs: calculate_version
-    if: needs.calculate_version.outputs.tag_exists == 'false'
+          BODY="$(
+            curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "$API_URL" | jq -r '.body // "No changelog available"'
+          )" || BODY="No changelog available"
+
+          {
+            echo "changelog<<EOF"
+            echo "$BODY"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists in this repo
+        id: check_release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.version.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG_NAME}"
+
+          HTTP_CODE="$(
+            curl -sS \
+              -o /tmp/release-check.json \
+              -w "%{http_code}" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "$API_URL"
+          )"
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Release ${TAG_NAME} already exists in ${GITHUB_REPOSITORY}"
+            echo "release_exists=true" >> "$GITHUB_OUTPUT"
+          elif [ "$HTTP_CODE" = "404" ]; then
+            echo "Release ${TAG_NAME} does not exist in ${GITHUB_REPOSITORY}"
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unexpected GitHub API response: $HTTP_CODE"
+            cat /tmp/release-check.json
+            exit 1
+          fi
+
+  build_linux:
+    name: Build Linux
+    needs:
+      - calculate_version
+    if: needs.calculate_version.outputs.release_exists == 'false'
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: linux, arch: amd64, runner: ubuntu-latest }
-          - { os: linux, arch: "386", go386: softfloat, runner: ubuntu-latest }
-          - { os: linux, arch: "386", go386: sse2, runner: ubuntu-latest }
-          - { os: linux, arch: arm64, runner: ubuntu-latest }
-          - { os: linux, arch: arm, goarm: "7", runner: ubuntu-latest }
-          - { os: linux, arch: mips, goarch_extra: softfloat, runner: ubuntu-latest }
-          - { os: linux, arch: mips64, goarch_extra: softfloat, runner: ubuntu-latest }
-          - { os: linux, arch: mips64le, goarch_extra: hardfloat, runner: ubuntu-latest }
-          - { os: linux, arch: ppc64le, runner: ubuntu-latest }
-          - { os: linux, arch: s390x, runner: ubuntu-latest }
-          - { os: linux, arch: riscv64, runner: ubuntu-latest }
-          - { os: windows, arch: amd64, runner: windows-latest }
-          - { os: windows, arch: "386", runner: windows-latest }
-          - { os: windows, arch: arm64, runner: windows-latest }
-          - { os: darwin, arch: amd64, runner: macos-latest }
-          - { os: darwin, arch: arm64, runner: macos-latest }
-    runs-on: ${{ matrix.runner }}
+          - { arch: amd64 }
+          - { arch: arm64 }
+          - { arch: "386", go386: sse2 }
+          - { arch: arm, goarm: "7" }
+          - { arch: arm, goarm: "6" }
+          - { arch: mips, gomips: softfloat }
+          - { arch: mipsle, gomips: softfloat }
+          - { arch: mips64, gomips: softfloat }
+          - { arch: mips64le, gomips: hardfloat }
+          - { arch: riscv64 }
+          - { arch: ppc64le }
+          - { arch: s390x }
     steps:
-      - name: Checkout SagerNet/sing-box
-        uses: actions/checkout@v4
+      - name: Checkout upstream sing-box
+        uses: actions/checkout@v6
         with:
-          repository: SagerNet/sing-box
+          repository: ${{ env.UPSTREAM_REPO }}
           fetch-depth: 0
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
-          go-version: '1.24.x'
+          go-version: "~1.25.9"
 
-      - name: Initialize go.mod if missing
+      - name: Set build environment
         shell: bash
+        env:
+          VERSION: ${{ needs.calculate_version.outputs.version }}
+          TAG_NAME: ${{ needs.calculate_version.outputs.tag_name }}
         run: |
-          if [ ! -f go.mod ]; then
-            echo "Файл go.mod отсутствует, инициализируем..."
-            go mod init github.com/sagernet/sing-box
-            go mod tidy
-          fi
+          set -euo pipefail
 
-      - name: Initialize go.mod if missing (Windows)
-        if: matrix.os == 'windows'
-        shell: powershell
-        run: |
-          if (-not (Test-Path go.mod)) {
-            Write-Output "Файл go.mod отсутствует, инициализируем..."
-            go mod init github.com/sagernet/sing-box
-            go mod tidy
-          }
+          git tag "$TAG_NAME" -f
 
-      - name: Cache Go modules
-        if: matrix.os != 'darwin'
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
-      - name: Download dependencies
-        run: go mod download
+          echo "BUILD_TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)" >> "$GITHUB_ENV"
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Build sing-box
-        if: matrix.os != 'windows'
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          GO386: ${{ matrix.go386 }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+          GOMIPS64: ${{ matrix.gomips }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAGS="with_gvisor,with_quic,with_dhcp,with_utls,with_acme,with_clash_api,with_tailscale,with_v2ray_api"
-          VERSION="${{ needs.calculate_version.outputs.version }}"
-          BINARY_NAME="sing-box-${{ matrix.os }}-${{ matrix.arch }}"
-          if [ "${{ matrix.go386 }}" != "" ]; then
-            BINARY_NAME="${BINARY_NAME}-${{ matrix.go386 }}"
+          set -euo pipefail
+
+          mkdir -p dist
+
+          go build -v -trimpath \
+            -tags "$BUILD_TAGS" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            -o dist/sing-box \
+            ./cmd/sing-box
+
+      - name: Package Linux archive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DIR_NAME="sing-box-${VERSION}-linux-${{ matrix.arch }}"
+
+          if [ -n "${{ matrix.goarm }}" ]; then
+            DIR_NAME="${DIR_NAME}v${{ matrix.goarm }}"
           fi
-          if [ "${{ matrix.goarm }}" != "" ]; then
-            BINARY_NAME="${BINARY_NAME}}v${{ matrix.goarm }}"
+
+          if [ -n "${{ matrix.go386 }}" ] && [ "${{ matrix.go386 }}" != "sse2" ]; then
+            DIR_NAME="${DIR_NAME}-${{ matrix.go386 }}"
           fi
-          if [ "${{ matrix.goarch_extra }}" != "" ]; then
-            BINARY_NAME="${BINARY_NAME}-${{ matrix.goarch_extra }}"
+
+          if [ -n "${{ matrix.gomips }}" ] && [ "${{ matrix.gomips }}" != "hardfloat" ]; then
+            DIR_NAME="${DIR_NAME}-${{ matrix.gomips }}"
           fi
+
+          mkdir -p "package/${DIR_NAME}"
           mkdir -p artifacts
-          GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} GOARM=${{ matrix.goarm }} GO386=${{ matrix.go386 }} \
-          GOMIPS=${{ matrix.goarch_extra }} GOMIPS64=${{ matrix.goarch_extra }} CGO_ENABLED=0 \
-            go build -gcflags=all=-e -v -trimpath -tags "$TAGS" \
-            -ldflags "-s -buildid= -X 'github.com/sagernet/sing-box/constant.Version=$VERSION'" \
-            -o "./artifacts/$BINARY_NAME" ./cmd/sing-box
-        shell: bash {0}
 
-      - name: Build sing-box (Windows)
-        if: matrix.os == 'windows'
-        shell: powershell
-        run: |
-          $TAGS="with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_v2ray_api"
-          $VERSION="${{ needs.calculate_version.outputs.version }}"
-          $BINARY_NAME="sing-box-${{ matrix.os }}-${{ matrix.arch }}.exe"
-          if ("${{ matrix.go386 }}" -ne "") {
-            $BINARY_NAME="${BINARY_NAME%.exe}-${{ matrix.go386 }}.exe"
-          }
-          if ("${{ matrix.goarm }}" -ne "") {
-            $BINARY_NAME="${BINARY_NAME%.exe}v${{ matrix.goarm }}.exe"
-          }
-          if ("${{ matrix.goarch_extra }}" -ne "") {
-            $BINARY_NAME="${BINARY_NAME%.exe}-${{ matrix.goarch_extra }}.exe"
-          }
-          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-          $env:GOOS="${{ matrix.os }}"
-          $env:GOARCH="${{ matrix.arch }}"
-          if ("${{ matrix.goarm }}" -ne "") { $env:GOARM="${{ matrix.goarm }}" }
-          if ("${{ matrix.go386 }}" -ne "") { $env:GO386="${{ matrix.go386 }}" }
-          if ("${{ matrix.goarch_extra }}" -ne "") { $env:GOMIPS="${{ matrix.goarch_extra }}"; $env:GOMIPS64="${{ matrix.goarch_extra }}" }
-          $env:CGO_ENABLED="0"
-          go build -gcflags=all=-e -v -trimpath -tags "$TAGS" -ldflags "-s -buildid= -X 'github.com/sagernet/sing-box/constant.Version=$VERSION'" -o "./artifacts/$BINARY_NAME" ./cmd/sing-box
+          cp LICENSE "package/${DIR_NAME}/LICENSE"
+          cp dist/sing-box "package/${DIR_NAME}/sing-box"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          tar -C package -czvf "artifacts/${DIR_NAME}.tar.gz" "${DIR_NAME}"
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.os }}_${{ matrix.arch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}${{ matrix.go386 && format('_{0}', matrix.go386) || '' }}${{ matrix.goarch_extra && format('_{0}', matrix.goarch_extra) || '' }}
+          name: binary-linux_${{ matrix.arch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}${{ matrix.go386 && format('_{0}', matrix.go386) || '' }}${{ matrix.gomips && format('_{0}', matrix.gomips) || '' }}
+          path: artifacts/*
+
+  build_windows:
+    name: Build Windows
+    needs:
+      - calculate_version
+    if: needs.calculate_version.outputs.release_exists == 'false'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64 }
+          - { arch: arm64 }
+          - { arch: "386" }
+    steps:
+      - name: Checkout upstream sing-box
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "~1.25.9"
+
+      - name: Set build environment
+        shell: pwsh
+        run: |
+          git tag "${{ needs.calculate_version.outputs.tag_name }}" -f
+
+          $BUILD_TAGS = Get-Content release/DEFAULT_BUILD_TAGS_OTHERS
+          $LDFLAGS_SHARED = Get-Content release/LDFLAGS
+
+          "BUILD_TAGS=$BUILD_TAGS" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LDFLAGS_SHARED=$LDFLAGS_SHARED" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VERSION=${{ needs.calculate_version.outputs.version }}" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build sing-box
+        shell: pwsh
+        env:
+          CGO_ENABLED: "0"
+          GOOS: windows
+          GOARCH: ${{ matrix.arch }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          go build -v -trimpath `
+            -tags "$env:BUILD_TAGS" `
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$env:VERSION' $env:LDFLAGS_SHARED -s -w -buildid=" `
+            -o dist/sing-box.exe `
+            ./cmd/sing-box
+
+      - name: Package Windows archive
+        shell: pwsh
+        run: |
+          $DIR_NAME = "sing-box-$env:VERSION-windows-${{ matrix.arch }}"
+
+          New-Item -ItemType Directory -Force -Path "package/$DIR_NAME" | Out-Null
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+
+          Copy-Item LICENSE "package/$DIR_NAME/LICENSE"
+          Copy-Item "dist/sing-box.exe" "package/$DIR_NAME/sing-box.exe"
+
+          Compress-Archive `
+            -Path "package/$DIR_NAME" `
+            -DestinationPath "artifacts/$DIR_NAME.zip" `
+            -Force
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: binary-windows_${{ matrix.arch }}
           path: artifacts/*
 
   release:
     name: Create Release
-    needs: [calculate_version, build]
-    permissions:
-      contents: write
+    needs:
+      - calculate_version
+      - build_linux
+      - build_windows
+    if: needs.calculate_version.outputs.release_exists == 'false' && !failure() && !cancelled()
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: artifacts
+          merge-multiple: true
+
+      - name: Prepare release notes
+        shell: bash
+        env:
+          CHANGELOG: ${{ needs.calculate_version.outputs.changelog }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$CHANGELOG" > RELEASE_NOTES.md
 
       - name: Debug artifact structure
+        shell: bash
         run: |
-          echo "Содержимое директории artifacts:"
-          ls -R artifacts
+          set -euo pipefail
+          echo "Artifacts:"
+          find artifacts -type f -maxdepth 5 | sort
 
-      - name: Create release
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs').promises;
-            const path = require('path');
-            
-            // Define variables with proper escaping
-            const version = '${{ needs.calculate_version.outputs.version }}';
-            const tagName = `v${version}`;
-            const releaseName = `${version}`;
-            const body = ${{ toJson(needs.calculate_version.outputs.changelog) }}; // Safely escape changelog
-            
-            const artifactDir = 'artifacts';
-      
-            // Function to recursively get artifact files
-            async function getArtifactFiles(dir) {
-              let files = [];
-              const items = await fs.readdir(dir, { withFileTypes: true });
-              for (const item of items) {
-                const fullPath = path.join(dir, item.name);
-                if (item.isDirectory()) {
-                  files = files.concat(await getArtifactFiles(fullPath));
-                } else {
-                  files.push(fullPath);
-                }
-              }
-              return files;
-            }
-      
-            // Create the release
-            const release = await github.rest.repos.createRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag_name: tagName,
-              name: releaseName,
-              body: body,
-              draft: false,
-              prerelease: tagName.includes('beta')
-            });
-      
-            // Upload artifacts
-            const files = await getArtifactFiles(artifactDir);
-            for (const file of files) {
-              console.log(`Uploading ${file}...`);
-              await github.rest.repos.uploadReleaseAsset({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                release_id: release.data.id,
-                name: path.basename(file),
-                data: await fs.readFile(file)
-              });
-            }
+      - name: Create GitHub release
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.calculate_version.outputs.tag_name }}
+          VERSION: ${{ needs.calculate_version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t FILES < <(find artifacts -type f | sort)
+
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "No artifacts found"
+            exit 1
+          fi
+
+          gh release create "$TAG_NAME" "${FILES[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$VERSION" \
+            --notes-file RELEASE_NOTES.md \
+            --latest
