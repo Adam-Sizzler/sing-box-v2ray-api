@@ -210,7 +210,7 @@ jobs:
           VERSION: ${{ needs.calculate_version.outputs.version }}
         run: |
           set -euo pipefail
-          BINARY_NAME="sing-box-${VERSION}-linux-${{ matrix.arch }}"
+          BINARY_NAME="sing-box-linux-${{ matrix.arch }}"
           mkdir -p artifacts
           cp dist/sing-box "artifacts/${BINARY_NAME}"
 
