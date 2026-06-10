@@ -197,7 +197,6 @@ jobs:
           TAGS="with_gvisor,with_quic,with_dhcp,with_utls,with_acme,with_clash_api,with_tailscale,with_v2ray_api"
 
           mkdir -p dist
-          mkdir -p artifacts
 
           go build -gcflags=all=-e -v -trimpath \
             -tags "$TAGS" \
@@ -205,14 +204,15 @@ jobs:
             -o "dist/sing-box" \
             ./cmd/sing-box
 
-          DIR_NAME="sing-box-${VERSION}-linux-${{ matrix.arch }}"
-
-          mkdir -p "package/${DIR_NAME}"
-
-          cp LICENSE "package/${DIR_NAME}/LICENSE"
-          cp dist/sing-box "package/${DIR_NAME}/sing-box"
-
-          tar -C package -czvf "artifacts/${DIR_NAME}.tar.gz" "${DIR_NAME}"
+      - name: Prepare binary for upload
+        shell: bash
+        env:
+          VERSION: ${{ needs.calculate_version.outputs.version }}
+        run: |
+          set -euo pipefail
+          BINARY_NAME="sing-box-${VERSION}-linux-${{ matrix.arch }}"
+          mkdir -p artifacts
+          cp dist/sing-box "artifacts/${BINARY_NAME}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
@@ -278,7 +278,6 @@ jobs:
           $TAGS = "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_v2ray_api"
 
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
 
           go build -gcflags=all=-e -v -trimpath `
             -tags "$TAGS" `
@@ -286,17 +285,14 @@ jobs:
             -o "dist/sing-box.exe" `
             ./cmd/sing-box
 
-          $DIR_NAME = "sing-box-$env:VERSION-windows-${{ matrix.arch }}"
-
-          New-Item -ItemType Directory -Force -Path "package/$DIR_NAME" | Out-Null
-
-          Copy-Item LICENSE "package/$DIR_NAME/LICENSE"
-          Copy-Item "dist/sing-box.exe" "package/$DIR_NAME/sing-box.exe"
-
-          Compress-Archive `
-            -Path "package/$DIR_NAME" `
-            -DestinationPath "artifacts/$DIR_NAME.zip" `
-            -Force
+      - name: Prepare binary for upload
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.calculate_version.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          $BINARY_NAME = "sing-box-${env:VERSION}-windows-${{ matrix.arch }}.exe"
+          Copy-Item "dist/sing-box.exe" "artifacts/$BINARY_NAME"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
