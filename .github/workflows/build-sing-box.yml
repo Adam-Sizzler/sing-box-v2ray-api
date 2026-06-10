@@ -220,92 +220,11 @@ jobs:
           name: linux_${{ matrix.arch }}
           path: artifacts/*
 
-  build_windows:
-    name: Build Windows
-    needs:
-      - calculate_version
-    if: needs.calculate_version.outputs.should_build == 'true'
-    runs-on: windows-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { arch: amd64 }
-          - { arch: arm64 }
-
-    steps:
-      - name: Checkout SagerNet/sing-box
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ env.UPSTREAM_REPO }}
-          ref: ${{ needs.calculate_version.outputs.tag_name }}
-          fetch-depth: 0
-
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: "1.24.x"
-
-      - name: Cache Go modules
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~\AppData\Local\go-build
-            ~\go\pkg\mod
-          key: ${{ runner.os }}-go-${{ matrix.arch }}-${{ hashFiles('go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-${{ matrix.arch }}-
-            ${{ runner.os }}-go-
-
-      - name: Download dependencies
-        shell: pwsh
-        run: |
-          go mod download
-
-      - name: Build sing-box
-        shell: pwsh
-        env:
-          VERSION: ${{ needs.calculate_version.outputs.version }}
-          TAG_NAME: ${{ needs.calculate_version.outputs.tag_name }}
-          CGO_ENABLED: "0"
-          GOOS: windows
-          GOARCH: ${{ matrix.arch }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git tag "$env:TAG_NAME" -f
-
-          $TAGS = "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_v2ray_api"
-
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-
-          go build -gcflags=all=-e -v -trimpath `
-            -tags "$TAGS" `
-            -ldflags "-s -buildid= -X 'github.com/sagernet/sing-box/constant.Version=$env:VERSION'" `
-            -o "dist/sing-box.exe" `
-            ./cmd/sing-box
-
-      - name: Prepare binary for upload
-        shell: pwsh
-        env:
-          VERSION: ${{ needs.calculate_version.outputs.version }}
-        run: |
-          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
-          $BINARY_NAME = "sing-box-${env:VERSION}-windows-${{ matrix.arch }}.exe"
-          Copy-Item "dist/sing-box.exe" "artifacts/$BINARY_NAME"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: windows_${{ matrix.arch }}
-          path: artifacts/*
-
   release:
     name: Create or update Release
     needs:
       - calculate_version
       - build_linux
-      - build_windows
     if: needs.calculate_version.outputs.should_build == 'true' && !failure() && !cancelled()
     runs-on: ubuntu-latest
 
