@@ -1,0 +1,862 @@
+diff -ruN singbox_orig/sing-box-stable/adapter/inbound/manager.go singbox_src/sing-box-stable/adapter/inbound/manager.go
+--- singbox_orig/sing-box-stable/adapter/inbound/manager.go	2026-06-03 08:33:44.000000000 +0000
++++ singbox_src/sing-box-stable/adapter/inbound/manager.go	2026-06-11 14:50:09.886855335 +0000
+@@ -83,7 +83,7 @@
+ func (m *Manager) Inbounds() []adapter.Inbound {
+ 	m.access.Lock()
+ 	defer m.access.Unlock()
+-	return m.inbounds
++	return append([]adapter.Inbound(nil), m.inbounds...)
+ }
+ 
+ func (m *Manager) Get(tag string) (adapter.Inbound, bool) {
+diff -ruN singbox_orig/sing-box-stable/adapter/inbound.go singbox_src/sing-box-stable/adapter/inbound.go
+--- singbox_orig/sing-box-stable/adapter/inbound.go	2026-06-03 08:33:44.000000000 +0000
++++ singbox_src/sing-box-stable/adapter/inbound.go	2026-06-11 14:39:07.007972012 +0000
+@@ -17,6 +17,20 @@
+ 	Tag() string
+ }
+ 
++// RuntimeUserInbound is implemented by inbound protocols whose users can be
++// updated at runtime without restarting the listener or closing active sessions.
++//
++// The concrete user type depends on inbound Type():
++//   - vless: option.VLESSUser
++//   - vmess: option.VMessUser
++//   - trojan: option.TrojanUser
++type RuntimeUserInbound interface {
++	Inbound
++	AddUser(ctx context.Context, user any) error
++	RemoveUser(ctx context.Context, name string) error
++	ListUsers(ctx context.Context) []any
++}
++
+ type TCPInjectableInbound interface {
+ 	Inbound
+ 	ConnectionHandlerEx
+diff -ruN singbox_orig/sing-box-stable/experimental/clashapi/inbound_users.go singbox_src/sing-box-stable/experimental/clashapi/inbound_users.go
+--- singbox_orig/sing-box-stable/experimental/clashapi/inbound_users.go	1970-01-01 00:00:00.000000000 +0000
++++ singbox_src/sing-box-stable/experimental/clashapi/inbound_users.go	2026-06-11 14:49:45.213640070 +0000
+@@ -0,0 +1,214 @@
++package clashapi
++
++import (
++	"io"
++	"net/http"
++
++	"github.com/sagernet/sing-box/adapter"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/option"
++	E "github.com/sagernet/sing/common/exceptions"
++	F "github.com/sagernet/sing/common/format"
++	"github.com/sagernet/sing/common/json"
++
++	"github.com/go-chi/chi/v5"
++	"github.com/go-chi/render"
++)
++
++func inboundRouter(s *Server) http.Handler {
++	r := chi.NewRouter()
++	r.Get("/", s.listInbounds)
++	r.Post("/", s.addInbound)
++	r.Delete("/{tag}", s.removeInbound)
++	r.Get("/{tag}/users", s.listInboundUsers)
++	r.Post("/{tag}/users", s.addInboundUser)
++	r.Delete("/{tag}/users/{name}", s.removeInboundUser)
++	return r
++}
++
++func (s *Server) listInbounds(writer http.ResponseWriter, request *http.Request) {
++	if s.inbound == nil {
++		render.Status(request, http.StatusInternalServerError)
++		render.PlainText(writer, request, "inbound manager not available")
++		return
++	}
++	inbounds := s.inbound.Inbounds()
++	items := make([]render.M, 0, len(inbounds))
++	for _, inbound := range inbounds {
++		items = append(items, render.M{
++			"tag":  inbound.Tag(),
++			"type": inbound.Type(),
++		})
++	}
++	render.JSON(writer, request, render.M{
++		"inbounds": items,
++	})
++}
++
++func (s *Server) addInbound(writer http.ResponseWriter, request *http.Request) {
++	if s.inbound == nil {
++		render.Status(request, http.StatusInternalServerError)
++		render.PlainText(writer, request, "inbound manager not available")
++		return
++	}
++	if s.router == nil {
++		render.Status(request, http.StatusInternalServerError)
++		render.PlainText(writer, request, "router not available")
++		return
++	}
++	if s.logFactory == nil {
++		render.Status(request, http.StatusInternalServerError)
++		render.PlainText(writer, request, "log factory not available")
++		return
++	}
++
++	content, err := io.ReadAll(request.Body)
++	if err != nil {
++		render.Status(request, http.StatusBadRequest)
++		render.PlainText(writer, request, err.Error())
++		return
++	}
++	var inboundOptions option.Inbound
++	err = json.UnmarshalContext(s.ctx, content, &inboundOptions)
++	if err != nil {
++		render.Status(request, http.StatusBadRequest)
++		render.PlainText(writer, request, err.Error())
++		return
++	}
++	if inboundOptions.Type == "" {
++		render.Status(request, http.StatusBadRequest)
++		render.PlainText(writer, request, "inbound type is required")
++		return
++	}
++	if inboundOptions.Tag == "" {
++		render.Status(request, http.StatusBadRequest)
++		render.PlainText(writer, request, "inbound tag is required for runtime inbound management")
++		return
++	}
++	if _, loaded := s.inbound.Get(inboundOptions.Tag); loaded {
++		render.Status(request, http.StatusConflict)
++		render.PlainText(writer, request, F.ToString("inbound ", inboundOptions.Tag, " already exists"))
++		return
++	}
++
++	err = s.inbound.Create(
++		s.ctx,
++		s.router,
++		s.logFactory.NewLogger(F.ToString("inbound/", inboundOptions.Type, "[", inboundOptions.Tag, "]")),
++		inboundOptions.Tag,
++		inboundOptions.Type,
++		inboundOptions.Options,
++	)
++	if err != nil {
++		render.Status(request, http.StatusBadRequest)
++		render.PlainText(writer, request, err.Error())
++		return
++	}
++	writer.WriteHeader(http.StatusCreated)
++}
++
++func (s *Server) removeInbound(writer http.ResponseWriter, request *http.Request) {
++	if s.inbound == nil {
++		render.Status(request, http.StatusInternalServerError)
++		render.PlainText(writer, request, "inbound manager not available")
++		return
++	}
++	tag := getEscapeParam(request, "tag")
++	if tag == "" {
++		render.Status(request, http.StatusBadRequest)
++		render.PlainText(writer, request, "inbound tag is required")
++		return
++	}
++	if err := s.inbound.Remove(tag); err != nil {
++		render.Status(request, http.StatusNotFound)
++		render.PlainText(writer, request, err.Error())
++		return
++	}
++	writer.WriteHeader(http.StatusNoContent)
++}
++
++func (s *Server) runtimeUserInbound(request *http.Request) (adapter.RuntimeUserInbound, error) {
++	if s.inbound == nil {
++		return nil, E.New("inbound manager not available")
++	}
++	tag := getEscapeParam(request, "tag")
++	inbound, loaded := s.inbound.Get(tag)
++	if !loaded {
++		return nil, E.New("inbound ", tag, " not found")
++	}
++	userInbound, loaded := inbound.(adapter.RuntimeUserInbound)
++	if !loaded {
++		return nil, E.New("inbound ", tag, " does not support runtime user management")
++	}
++	return userInbound, nil
++}
++
++func (s *Server) listInboundUsers(writer http.ResponseWriter, request *http.Request) {
++	inbound, err := s.runtimeUserInbound(request)
++	if err != nil {
++		render.Status(request, http.StatusBadRequest)
++		render.PlainText(writer, request, err.Error())
++		return
++	}
++	render.JSON(writer, request, render.M{
++		"users": inbound.ListUsers(request.Context()),
++	})
++}
++
++func (s *Server) addInboundUser(writer http.ResponseWriter, request *http.Request) {
++	inbound, err := s.runtimeUserInbound(request)
++	if err != nil {
++		render.Status(request, http.StatusBadRequest)
++		render.PlainText(writer, request, err.Error())
++		return
++	}
++
++	var user any
++	switch inbound.Type() {
++	case C.TypeVLESS:
++		var typedUser option.VLESSUser
++		if err = render.DecodeJSON(request.Body, &typedUser); err == nil {
++			user = typedUser
++		}
++	case C.TypeVMess:
++		var typedUser option.VMessUser
++		if err = render.DecodeJSON(request.Body, &typedUser); err == nil {
++			user = typedUser
++		}
++	case C.TypeTrojan:
++		var typedUser option.TrojanUser
++		if err = render.DecodeJSON(request.Body, &typedUser); err == nil {
++			user = typedUser
++		}
++	default:
++		err = E.New("unsupported inbound type: ", inbound.Type())
++	}
++	if err != nil {
++		render.Status(request, http.StatusBadRequest)
++		render.PlainText(writer, request, err.Error())
++		return
++	}
++
++	if err = inbound.AddUser(request.Context(), user); err != nil {
++		render.Status(request, http.StatusBadRequest)
++		render.PlainText(writer, request, err.Error())
++		return
++	}
++	writer.WriteHeader(http.StatusCreated)
++}
++
++func (s *Server) removeInboundUser(writer http.ResponseWriter, request *http.Request) {
++	inbound, err := s.runtimeUserInbound(request)
++	if err != nil {
++		render.Status(request, http.StatusBadRequest)
++		render.PlainText(writer, request, err.Error())
++		return
++	}
++	name := getEscapeParam(request, "name")
++	if err = inbound.RemoveUser(request.Context(), name); err != nil {
++		render.Status(request, http.StatusBadRequest)
++		render.PlainText(writer, request, err.Error())
++		return
++	}
++	writer.WriteHeader(http.StatusNoContent)
++}
+diff -ruN singbox_orig/sing-box-stable/experimental/clashapi/server.go singbox_src/sing-box-stable/experimental/clashapi/server.go
+--- singbox_orig/sing-box-stable/experimental/clashapi/server.go	2026-06-03 08:33:44.000000000 +0000
++++ singbox_src/sing-box-stable/experimental/clashapi/server.go	2026-06-11 14:49:58.170289477 +0000
+@@ -44,9 +44,11 @@
+ 	ctx            context.Context
+ 	router         adapter.Router
+ 	dnsRouter      adapter.DNSRouter
++	inbound        adapter.InboundManager
+ 	outbound       adapter.OutboundManager
+ 	endpoint       adapter.EndpointManager
+ 	logger         log.Logger
++	logFactory     log.Factory
+ 	httpServer     *http.Server
+ 	trafficManager *trafficontrol.Manager
+ 	urlTestHistory adapter.URLTestHistoryStorage
+@@ -66,12 +68,14 @@
+ 	trafficManager := trafficontrol.NewManager()
+ 	chiRouter := chi.NewRouter()
+ 	s := &Server{
+-		ctx:       ctx,
+-		router:    service.FromContext[adapter.Router](ctx),
+-		dnsRouter: service.FromContext[adapter.DNSRouter](ctx),
+-		outbound:  service.FromContext[adapter.OutboundManager](ctx),
+-		endpoint:  service.FromContext[adapter.EndpointManager](ctx),
+-		logger:    logFactory.NewLogger("clash-api"),
++		ctx:        ctx,
++		router:     service.FromContext[adapter.Router](ctx),
++		dnsRouter:  service.FromContext[adapter.DNSRouter](ctx),
++		inbound:    service.FromContext[adapter.InboundManager](ctx),
++		outbound:   service.FromContext[adapter.OutboundManager](ctx),
++		endpoint:   service.FromContext[adapter.EndpointManager](ctx),
++		logger:     logFactory.NewLogger("clash-api"),
++		logFactory: logFactory,
+ 		httpServer: &http.Server{
+ 			Addr:    options.ExternalController,
+ 			Handler: chiRouter,
+@@ -120,6 +124,7 @@
+ 		r.Get("/version", version)
+ 		r.Mount("/configs", configRouter(s, logFactory))
+ 		r.Mount("/proxies", proxyRouter(s, s.router))
++		r.Mount("/inbounds", inboundRouter(s))
+ 		r.Mount("/rules", ruleRouter(s.router))
+ 		r.Mount("/connections", connectionRouter(s.ctx, s.router, trafficManager))
+ 		r.Mount("/providers/proxies", proxyProviderRouter())
+diff -ruN singbox_orig/sing-box-stable/protocol/trojan/inbound.go singbox_src/sing-box-stable/protocol/trojan/inbound.go
+--- singbox_orig/sing-box-stable/protocol/trojan/inbound.go	2026-06-03 08:33:44.000000000 +0000
++++ singbox_src/sing-box-stable/protocol/trojan/inbound.go	2026-06-11 14:42:30.125152780 +0000
+@@ -4,6 +4,8 @@
+ 	"context"
+ 	"net"
+ 	"os"
++	"strings"
++	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/inbound"
+@@ -27,7 +29,10 @@
+ 	inbound.Register[option.TrojanInboundOptions](registry, C.TypeTrojan, NewInbound)
+ }
+ 
+-var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
++var (
++	_ adapter.TCPInjectableInbound = (*Inbound)(nil)
++	_ adapter.RuntimeUserInbound   = (*Inbound)(nil)
++)
+ 
+ type Inbound struct {
+ 	inbound.Adapter
+@@ -35,6 +40,8 @@
+ 	logger                   log.ContextLogger
+ 	listener                 *listener.Listener
+ 	service                  *trojan.Service[int]
++	serviceAccess            sync.RWMutex
++	usersAccess              sync.RWMutex
+ 	users                    []option.TrojanUser
+ 	tlsConfig                tls.ServerConfig
+ 	fallbackAddr             M.Socksaddr
+@@ -87,11 +94,7 @@
+ 		fallbackHandler = adapter.NewUpstreamContextHandlerEx(inbound.fallbackConnection, nil)
+ 	}
+ 	service := trojan.NewService[int](adapter.NewUpstreamContextHandlerEx(inbound.newConnection, inbound.newPacketConnection), fallbackHandler, logger)
+-	err := service.UpdateUsers(common.MapIndexed(options.Users, func(index int, it option.TrojanUser) int {
+-		return index
+-	}), common.Map(options.Users, func(it option.TrojanUser) string {
+-		return it.Password
+-	}))
++	err := updateTrojanUsers(service, options.Users)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -174,13 +177,102 @@
+ 		}
+ 		conn = tlsConn
+ 	}
++	h.serviceAccess.RLock()
+ 	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
++	h.serviceAccess.RUnlock()
+ 	if err != nil {
+ 		N.CloseOnHandshakeFailure(conn, onClose, err)
+ 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
+ 	}
+ }
+ 
++func updateTrojanUsers(service *trojan.Service[int], users []option.TrojanUser) error {
++	return service.UpdateUsers(common.MapIndexed(users, func(index int, _ option.TrojanUser) int {
++		return index
++	}), common.Map(users, func(it option.TrojanUser) string {
++		return it.Password
++	}))
++}
++
++func (h *Inbound) userName(index int) string {
++	h.usersAccess.RLock()
++	defer h.usersAccess.RUnlock()
++	if index < 0 || index >= len(h.users) || h.users[index].Name == "" {
++		return F.ToString(index)
++	}
++	return h.users[index].Name
++}
++
++func (h *Inbound) ListUsers(ctx context.Context) []any {
++	h.usersAccess.RLock()
++	defer h.usersAccess.RUnlock()
++	users := make([]any, len(h.users))
++	for index, user := range h.users {
++		users[index] = user
++	}
++	return users
++}
++
++func (h *Inbound) AddUser(ctx context.Context, rawUser any) error {
++	user, ok := rawUser.(option.TrojanUser)
++	if !ok {
++		return E.New("invalid Trojan user")
++	}
++	if user.Name == "" {
++		return E.New("user name is required for runtime user management")
++	}
++	if user.Password == "" {
++		return E.New("user password is required")
++	}
++
++	h.serviceAccess.Lock()
++	defer h.serviceAccess.Unlock()
++	h.usersAccess.Lock()
++	defer h.usersAccess.Unlock()
++	for _, existingUser := range h.users {
++		if strings.EqualFold(existingUser.Name, user.Name) {
++			return E.New("user ", user.Name, " already exists")
++		}
++		if existingUser.Password == user.Password {
++			return E.New("password already exists")
++		}
++	}
++	newUsers := append(append([]option.TrojanUser(nil), h.users...), user)
++	if err := updateTrojanUsers(h.service, newUsers); err != nil {
++		return err
++	}
++	h.users = newUsers
++	return nil
++}
++
++func (h *Inbound) RemoveUser(ctx context.Context, name string) error {
++	if name == "" {
++		return E.New("user name is required")
++	}
++
++	h.serviceAccess.Lock()
++	defer h.serviceAccess.Unlock()
++	h.usersAccess.Lock()
++	defer h.usersAccess.Unlock()
++	newUsers := make([]option.TrojanUser, 0, len(h.users))
++	found := false
++	for _, user := range h.users {
++		if strings.EqualFold(user.Name, name) {
++			found = true
++			continue
++		}
++		newUsers = append(newUsers, user)
++	}
++	if !found {
++		return E.New("user ", name, " not found")
++	}
++	if err := updateTrojanUsers(h.service, newUsers); err != nil {
++		return err
++	}
++	h.users = newUsers
++	return nil
++}
++
+ func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+@@ -189,10 +281,8 @@
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
+-	if user == "" {
+-		user = F.ToString(userIndex)
+-	} else {
++	user := h.userName(userIndex)
++	if user != F.ToString(userIndex) {
+ 		metadata.User = user
+ 	}
+ 	h.logger.InfoContext(ctx, "[", user, "] inbound connection to ", metadata.Destination)
+@@ -207,10 +297,8 @@
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
+-	if user == "" {
+-		user = F.ToString(userIndex)
+-	} else {
++	user := h.userName(userIndex)
++	if user != F.ToString(userIndex) {
+ 		metadata.User = user
+ 	}
+ 	h.logger.InfoContext(ctx, "[", user, "] inbound packet connection to ", metadata.Destination)
+diff -ruN singbox_orig/sing-box-stable/protocol/vless/inbound.go singbox_src/sing-box-stable/protocol/vless/inbound.go
+--- singbox_orig/sing-box-stable/protocol/vless/inbound.go	2026-06-03 08:33:44.000000000 +0000
++++ singbox_src/sing-box-stable/protocol/vless/inbound.go	2026-06-11 14:42:30.123820361 +0000
+@@ -4,6 +4,8 @@
+ 	"context"
+ 	"net"
+ 	"os"
++	"strings"
++	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/inbound"
+@@ -31,18 +33,23 @@
+ 	inbound.Register[option.VLESSInboundOptions](registry, C.TypeVLESS, NewInbound)
+ }
+ 
+-var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
++var (
++	_ adapter.TCPInjectableInbound = (*Inbound)(nil)
++	_ adapter.RuntimeUserInbound   = (*Inbound)(nil)
++)
+ 
+ type Inbound struct {
+ 	inbound.Adapter
+-	ctx       context.Context
+-	router    adapter.ConnectionRouterEx
+-	logger    logger.ContextLogger
+-	listener  *listener.Listener
+-	users     []option.VLESSUser
+-	service   *vless.Service[int]
+-	tlsConfig tls.ServerConfig
+-	transport adapter.V2RayServerTransport
++	ctx           context.Context
++	router        adapter.ConnectionRouterEx
++	logger        logger.ContextLogger
++	listener      *listener.Listener
++	serviceAccess sync.RWMutex
++	usersAccess   sync.RWMutex
++	users         []option.VLESSUser
++	service       *vless.Service[int]
++	tlsConfig     tls.ServerConfig
++	transport     adapter.V2RayServerTransport
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VLESSInboundOptions) (adapter.Inbound, error) {
+@@ -59,13 +66,7 @@
+ 		return nil, err
+ 	}
+ 	service := vless.NewService[int](logger, adapter.NewUpstreamContextHandlerEx(inbound.newConnectionEx, inbound.newPacketConnectionEx))
+-	service.UpdateUsers(common.MapIndexed(inbound.users, func(index int, _ option.VLESSUser) int {
+-		return index
+-	}), common.Map(inbound.users, func(it option.VLESSUser) string {
+-		return it.UUID
+-	}), common.Map(inbound.users, func(it option.VLESSUser) string {
+-		return it.Flow
+-	}))
++	updateVLESSUsers(service, inbound.users)
+ 	inbound.service = service
+ 	if options.TLS != nil {
+ 		inbound.tlsConfig, err = tls.NewServerWithOptions(tls.ServerOptions{
+@@ -157,13 +158,100 @@
+ 		}
+ 		conn = tlsConn
+ 	}
++	h.serviceAccess.RLock()
+ 	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
++	h.serviceAccess.RUnlock()
+ 	if err != nil {
+ 		N.CloseOnHandshakeFailure(conn, onClose, err)
+ 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
+ 	}
+ }
+ 
++func updateVLESSUsers(service *vless.Service[int], users []option.VLESSUser) {
++	service.UpdateUsers(common.MapIndexed(users, func(index int, _ option.VLESSUser) int {
++		return index
++	}), common.Map(users, func(it option.VLESSUser) string {
++		return it.UUID
++	}), common.Map(users, func(it option.VLESSUser) string {
++		return it.Flow
++	}))
++}
++
++func (h *Inbound) userName(index int) string {
++	h.usersAccess.RLock()
++	defer h.usersAccess.RUnlock()
++	if index < 0 || index >= len(h.users) || h.users[index].Name == "" {
++		return F.ToString(index)
++	}
++	return h.users[index].Name
++}
++
++func (h *Inbound) ListUsers(ctx context.Context) []any {
++	h.usersAccess.RLock()
++	defer h.usersAccess.RUnlock()
++	users := make([]any, len(h.users))
++	for index, user := range h.users {
++		users[index] = user
++	}
++	return users
++}
++
++func (h *Inbound) AddUser(ctx context.Context, rawUser any) error {
++	user, ok := rawUser.(option.VLESSUser)
++	if !ok {
++		return E.New("invalid VLESS user")
++	}
++	if user.Name == "" {
++		return E.New("user name is required for runtime user management")
++	}
++	if user.UUID == "" {
++		return E.New("user uuid is required")
++	}
++
++	h.serviceAccess.Lock()
++	defer h.serviceAccess.Unlock()
++	h.usersAccess.Lock()
++	defer h.usersAccess.Unlock()
++	for _, existingUser := range h.users {
++		if strings.EqualFold(existingUser.Name, user.Name) {
++			return E.New("user ", user.Name, " already exists")
++		}
++		if strings.EqualFold(existingUser.UUID, user.UUID) {
++			return E.New("uuid already exists")
++		}
++	}
++	newUsers := append(append([]option.VLESSUser(nil), h.users...), user)
++	updateVLESSUsers(h.service, newUsers)
++	h.users = newUsers
++	return nil
++}
++
++func (h *Inbound) RemoveUser(ctx context.Context, name string) error {
++	if name == "" {
++		return E.New("user name is required")
++	}
++
++	h.serviceAccess.Lock()
++	defer h.serviceAccess.Unlock()
++	h.usersAccess.Lock()
++	defer h.usersAccess.Unlock()
++	newUsers := make([]option.VLESSUser, 0, len(h.users))
++	found := false
++	for _, user := range h.users {
++		if strings.EqualFold(user.Name, name) {
++			found = true
++			continue
++		}
++		newUsers = append(newUsers, user)
++	}
++	if !found {
++		return E.New("user ", name, " not found")
++	}
++	updateVLESSUsers(h.service, newUsers)
++	h.users = newUsers
++	return nil
++}
++
+ func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+@@ -172,10 +260,8 @@
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
+-	if user == "" {
+-		user = F.ToString(userIndex)
+-	} else {
++	user := h.userName(userIndex)
++	if user != F.ToString(userIndex) {
+ 		metadata.User = user
+ 	}
+ 	h.logger.InfoContext(ctx, "[", user, "] inbound connection to ", metadata.Destination)
+@@ -190,10 +276,8 @@
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
+-	if user == "" {
+-		user = F.ToString(userIndex)
+-	} else {
++	user := h.userName(userIndex)
++	if user != F.ToString(userIndex) {
+ 		metadata.User = user
+ 	}
+ 	if metadata.Destination.Fqdn == packetaddr.SeqPacketMagicAddress {
+diff -ruN singbox_orig/sing-box-stable/protocol/vmess/inbound.go singbox_src/sing-box-stable/protocol/vmess/inbound.go
+--- singbox_orig/sing-box-stable/protocol/vmess/inbound.go	2026-06-03 08:33:44.000000000 +0000
++++ singbox_src/sing-box-stable/protocol/vmess/inbound.go	2026-06-11 14:42:30.124561074 +0000
+@@ -4,6 +4,8 @@
+ 	"context"
+ 	"net"
+ 	"os"
++	"strings"
++	"sync"
+ 
+ 	"github.com/sagernet/sing-box/adapter"
+ 	"github.com/sagernet/sing-box/adapter/inbound"
+@@ -32,18 +34,23 @@
+ 	inbound.Register[option.VMessInboundOptions](registry, C.TypeVMess, NewInbound)
+ }
+ 
+-var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
++var (
++	_ adapter.TCPInjectableInbound = (*Inbound)(nil)
++	_ adapter.RuntimeUserInbound   = (*Inbound)(nil)
++)
+ 
+ type Inbound struct {
+ 	inbound.Adapter
+-	ctx       context.Context
+-	router    adapter.ConnectionRouterEx
+-	logger    logger.ContextLogger
+-	listener  *listener.Listener
+-	service   *vmess.Service[int]
+-	users     []option.VMessUser
+-	tlsConfig tls.ServerConfig
+-	transport adapter.V2RayServerTransport
++	ctx           context.Context
++	router        adapter.ConnectionRouterEx
++	logger        logger.ContextLogger
++	listener      *listener.Listener
++	service       *vmess.Service[int]
++	serviceAccess sync.RWMutex
++	usersAccess   sync.RWMutex
++	users         []option.VMessUser
++	tlsConfig     tls.ServerConfig
++	transport     adapter.V2RayServerTransport
+ }
+ 
+ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VMessInboundOptions) (adapter.Inbound, error) {
+@@ -68,13 +75,7 @@
+ 	}
+ 	service := vmess.NewService[int](adapter.NewUpstreamContextHandlerEx(inbound.newConnectionEx, inbound.newPacketConnectionEx), serviceOptions...)
+ 	inbound.service = service
+-	err = service.UpdateUsers(common.MapIndexed(options.Users, func(index int, it option.VMessUser) int {
+-		return index
+-	}), common.Map(options.Users, func(it option.VMessUser) string {
+-		return it.UUID
+-	}), common.Map(options.Users, func(it option.VMessUser) int {
+-		return it.AlterId
+-	}))
++	err = updateVMessUsers(service, options.Users)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -163,13 +164,115 @@
+ 		}
+ 		conn = tlsConn
+ 	}
++	h.serviceAccess.RLock()
+ 	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
++	h.serviceAccess.RUnlock()
+ 	if err != nil {
+ 		N.CloseOnHandshakeFailure(conn, onClose, err)
+ 		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
+ 	}
+ }
+ 
++func updateVMessUsers(service *vmess.Service[int], users []option.VMessUser) error {
++	return service.UpdateUsers(common.MapIndexed(users, func(index int, _ option.VMessUser) int {
++		return index
++	}), common.Map(users, func(it option.VMessUser) string {
++		return it.UUID
++	}), common.Map(users, func(it option.VMessUser) int {
++		return it.AlterId
++	}))
++}
++
++func (h *Inbound) userName(index int) string {
++	h.usersAccess.RLock()
++	defer h.usersAccess.RUnlock()
++	if index < 0 || index >= len(h.users) || h.users[index].Name == "" {
++		return F.ToString(index)
++	}
++	return h.users[index].Name
++}
++
++func (h *Inbound) ListUsers(ctx context.Context) []any {
++	h.usersAccess.RLock()
++	defer h.usersAccess.RUnlock()
++	users := make([]any, len(h.users))
++	for index, user := range h.users {
++		users[index] = user
++	}
++	return users
++}
++
++func (h *Inbound) AddUser(ctx context.Context, rawUser any) error {
++	user, ok := rawUser.(option.VMessUser)
++	if !ok {
++		return E.New("invalid VMess user")
++	}
++	if user.Name == "" {
++		return E.New("user name is required for runtime user management")
++	}
++	if user.UUID == "" {
++		return E.New("user uuid is required")
++	}
++	if user.AlterId > 0 {
++		return E.New("runtime VMess user update with alterId > 0 is not supported")
++	}
++
++	h.serviceAccess.Lock()
++	defer h.serviceAccess.Unlock()
++	h.usersAccess.Lock()
++	defer h.usersAccess.Unlock()
++	for _, existingUser := range h.users {
++		if existingUser.AlterId > 0 {
++			return E.New("runtime VMess user update with alterId > 0 is not supported")
++		}
++		if strings.EqualFold(existingUser.Name, user.Name) {
++			return E.New("user ", user.Name, " already exists")
++		}
++		if strings.EqualFold(existingUser.UUID, user.UUID) {
++			return E.New("uuid already exists")
++		}
++	}
++	newUsers := append(append([]option.VMessUser(nil), h.users...), user)
++	if err := updateVMessUsers(h.service, newUsers); err != nil {
++		return err
++	}
++	h.users = newUsers
++	return nil
++}
++
++func (h *Inbound) RemoveUser(ctx context.Context, name string) error {
++	if name == "" {
++		return E.New("user name is required")
++	}
++
++	h.serviceAccess.Lock()
++	defer h.serviceAccess.Unlock()
++	h.usersAccess.Lock()
++	defer h.usersAccess.Unlock()
++	for _, existingUser := range h.users {
++		if existingUser.AlterId > 0 {
++			return E.New("runtime VMess user update with alterId > 0 is not supported")
++		}
++	}
++	newUsers := make([]option.VMessUser, 0, len(h.users))
++	found := false
++	for _, user := range h.users {
++		if strings.EqualFold(user.Name, name) {
++			found = true
++			continue
++		}
++		newUsers = append(newUsers, user)
++	}
++	if !found {
++		return E.New("user ", name, " not found")
++	}
++	if err := updateVMessUsers(h.service, newUsers); err != nil {
++		return err
++	}
++	h.users = newUsers
++	return nil
++}
++
+ func (h *Inbound) newConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+ 	metadata.Inbound = h.Tag()
+ 	metadata.InboundType = h.Type()
+@@ -178,10 +281,8 @@
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
+-	if user == "" {
+-		user = F.ToString(userIndex)
+-	} else {
++	user := h.userName(userIndex)
++	if user != F.ToString(userIndex) {
+ 		metadata.User = user
+ 	}
+ 	h.logger.InfoContext(ctx, "[", user, "] inbound connection to ", metadata.Destination)
+@@ -196,10 +297,8 @@
+ 		N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+ 		return
+ 	}
+-	user := h.users[userIndex].Name
+-	if user == "" {
+-		user = F.ToString(userIndex)
+-	} else {
++	user := h.userName(userIndex)
++	if user != F.ToString(userIndex) {
+ 		metadata.User = user
+ 	}
+ 	if metadata.Destination.Fqdn == packetaddr.SeqPacketMagicAddress {

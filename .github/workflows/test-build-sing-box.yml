@@ -1,0 +1,300 @@
+name: Build and Release sing-box
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "sing-box version, example: 1.13.5 or v1.13.5. Empty = latest"
+        required: false
+        type: string
+        default: ""
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 */12 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: SagerNet/sing-box
+
+jobs:
+  calculate_version:
+    name: Calculate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_tag.outputs.version }}
+      tag_name: ${{ steps.get_tag.outputs.tag_name }}
+      release_exists: ${{ steps.check_release.outputs.release_exists }}
+      should_build: ${{ steps.check_release.outputs.should_build }}
+      changelog: ${{ steps.extract_changelog.outputs.changelog }}
+
+    steps:
+      - name: Checkout SagerNet/sing-box
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          fetch-depth: 0
+
+      - name: Get requested or latest tag
+        id: get_tag
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+
+          git fetch --tags --force
+
+          if [ -n "${REQUESTED_VERSION}" ]; then
+            VERSION="${REQUESTED_VERSION#v}"
+            TAG_NAME="v${VERSION}"
+
+            if ! git rev-parse -q --verify "refs/tags/${TAG_NAME}" >/dev/null; then
+              echo "Requested upstream tag does not exist: ${TAG_NAME}"
+              exit 1
+            fi
+          else
+            VERSION="$(git describe --tags --abbrev=0 | sed 's/^v*//')"
+            TAG_NAME="v${VERSION}"
+          fi
+
+          echo "Selected tag is: ${TAG_NAME}"
+          echo "Selected version is: ${VERSION}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract changelog from GitHub release
+        id: extract_changelog
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.get_tag.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          CHANGELOG="$(
+            curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${UPSTREAM_REPO}/releases/tags/${TAG_NAME}" \
+              | jq -r '.body // "No changelog available"'
+          )" || CHANGELOG="No changelog available"
+
+          {
+            echo "changelog<<EOF"
+            echo "$CHANGELOG"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists in THIS repo
+        id: check_release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.get_tag.outputs.tag_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          HTTP_CODE="$(
+            curl -sS \
+              -o /tmp/release-check.json \
+              -w "%{http_code}" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG_NAME}"
+          )"
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Release ${TAG_NAME} already exists in ${GITHUB_REPOSITORY}"
+            echo "release_exists=true" >> "$GITHUB_OUTPUT"
+          elif [ "$HTTP_CODE" = "404" ]; then
+            echo "Release ${TAG_NAME} does not exist in ${GITHUB_REPOSITORY}"
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unexpected GitHub API response: $HTTP_CODE"
+            cat /tmp/release-check.json
+            exit 1
+          fi
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Manual run: build is forced"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif [ "$HTTP_CODE" = "404" ]; then
+            echo "No existing release: build is allowed"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Existing release on non-manual run: build is skipped"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build_linux:
+    name: Build Linux
+    needs:
+      - calculate_version
+    if: needs.calculate_version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64 }
+          - { arch: arm64 }
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v6
+        with:
+          path: build-repo
+
+      - name: Checkout SagerNet/sing-box
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.calculate_version.outputs.tag_name }}
+          fetch-depth: 0
+          path: sing-box
+
+      - name: Apply custom sing-box patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash build-repo/scripts/apply-sing-box-patches.sh sing-box
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.24.x"
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ matrix.arch }}-${{ hashFiles('sing-box/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ matrix.arch }}-
+            ${{ runner.os }}-go-
+
+      - name: Download dependencies
+        shell: bash
+        working-directory: sing-box
+        run: |
+          set -euo pipefail
+          go mod download
+
+      - name: Build sing-box
+        shell: bash
+        working-directory: sing-box
+        env:
+          VERSION: ${{ needs.calculate_version.outputs.version }}
+          TAG_NAME: ${{ needs.calculate_version.outputs.tag_name }}
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git tag "$TAG_NAME" -f
+
+          TAGS="with_gvisor,with_quic,with_dhcp,with_utls,with_acme,with_clash_api,with_tailscale,with_v2ray_api"
+
+          mkdir -p dist
+
+          go build -gcflags=all=-e -v -trimpath \
+            -tags "$TAGS" \
+            -ldflags "-s -buildid= -X 'github.com/sagernet/sing-box/constant.Version=${VERSION}'" \
+            -o "dist/sing-box" \
+            ./cmd/sing-box
+
+      - name: Prepare binary for upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          BINARY_NAME="sing-box-linux-${{ matrix.arch }}"
+          mkdir -p artifacts
+          cp sing-box/dist/sing-box "artifacts/${BINARY_NAME}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: linux_${{ matrix.arch }}
+          path: artifacts/*
+
+  release:
+    name: Create or update Release
+    needs:
+      - calculate_version
+      - build_linux
+    if: needs.calculate_version.outputs.should_build == 'true' && !failure() && !cancelled()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Debug artifact structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Artifacts:"
+          find artifacts -type f | sort
+
+      - name: Prepare release notes
+        shell: bash
+        env:
+          CHANGELOG: ${{ needs.calculate_version.outputs.changelog }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$CHANGELOG" > RELEASE_NOTES.md
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.calculate_version.outputs.tag_name }}
+          VERSION: ${{ needs.calculate_version.outputs.version }}
+          RELEASE_EXISTS: ${{ needs.calculate_version.outputs.release_exists }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t FILES < <(find artifacts -type f | sort)
+
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "No artifacts found"
+            exit 1
+          fi
+
+          if [ "$RELEASE_EXISTS" = "true" ]; then
+            echo "Release $TAG_NAME already exists, uploading assets with --clobber"
+
+            gh release edit "$TAG_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$VERSION" \
+              --notes-file RELEASE_NOTES.md
+
+            gh release upload "$TAG_NAME" "${FILES[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            echo "Creating release $TAG_NAME"
+
+            gh release create "$TAG_NAME" "${FILES[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$VERSION" \
+              --notes-file RELEASE_NOTES.md
+          fi
