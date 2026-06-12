@@ -238,11 +238,9 @@ jobs:
 
       - name: Prepare binary for upload
         shell: bash
-        env:
-          RELEASE_VERSION: ${{ needs.calculate_version.outputs.release_version }}
         run: |
           set -euo pipefail
-          BINARY_NAME="sing-box-${RELEASE_VERSION}-linux-${{ matrix.arch }}"
+          BINARY_NAME="sing-box-linux-${{ matrix.arch }}"
           mkdir -p artifacts
           cp sing-box/dist/sing-box "artifacts/${BINARY_NAME}"
 
